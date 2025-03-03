@@ -1,0 +1,364 @@
+"""
+Nikto Integration Plugin
+
+This module integrates Nikto web vulnerability scanner functionality into the MCP system.
+It handles executing Nikto scans and parsing their outputs into standardized events.
+"""
+
+import os
+import re
+import csv
+import xml.etree.ElementTree as ET
+import logging
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Union, Tuple
+
+from tools.base_plugin import BasePlugin
+
+class NiktoPlugin(BasePlugin):
+    """
+    Plugin for integrating Nikto web vulnerability scanner.
+    """
+    
+    def __init__(self, message_broker):
+        """Initialize the Nikto plugin."""
+        super().__init__(message_broker, "Nikto")
+        self.binary_path = self._find_binary()
+    
+    def _find_binary(self) -> str:
+        """
+        Find the Nikto binary in the system.
+        
+        Returns:
+            str: Path to the Nikto binary
+        """
+        # In a container environment, Nikto will typically be in the PATH
+        return "nikto"
+    
+    def get_capabilities(self) -> List[str]:
+        """
+        Get the capabilities of Nikto.
+        
+        Returns:
+            List[str]: List of capability strings
+        """
+        return [
+            "web_vulnerability_scanning", 
+            "configuration_checks", 
+            "misconfigurations_detection",
+            "webserver_enumeration"
+        ]
+    
+    def execute_task(self, task_parameters: Dict) -> Dict:
+        """
+        Execute a Nikto scan with the given parameters.
+        
+        Args:
+            task_parameters: Dictionary containing parameters for the scan
+                Required: 'target_host' - Host to scan (IP or hostname)
+                Optional: 'port' - Port to scan (default: 80)
+                Optional: 'ssl' - Use SSL/HTTPS (default: False)
+                Optional: 'options' - Additional Nikto options
+                Optional: 'timeout' - Scan timeout in seconds
+                Optional: 'output_format' - Format for output (xml, csv, txt) (default: xml)
+                
+        Returns:
+            Dict: Result information including scan output
+        """
+        # Validate required parameters
+        if 'target_host' not in task_parameters:
+            raise ValueError("Missing required parameter: target_host")
+        
+        target_host = task_parameters['target_host']
+        port = task_parameters.get('port', 80)
+        ssl = task_parameters.get('ssl', False)
+        timeout = task_parameters.get('timeout', 7200)  # Default 2 hour timeout (Nikto can be slow)
+        output_format = task_parameters.get('output_format', 'xml')
+        
+        # Build the command
+        command = [self.binary_path]
+        
+        # Add host specification with port
+        command.extend(['-h', f"{target_host}:{port}"])
+        
+        # Add SSL if needed
+        if ssl:
+            command.append('-ssl')
+        
+        # Output file setup
+        output_file = f"nikto_output.{output_format}"
+        if output_format == 'xml':
+            command.extend(['-Format', 'xml', '-o', output_file])
+        elif output_format == 'csv':
+            command.extend(['-Format', 'csv', '-o', output_file])
+        else:
+            command.extend(['-Format', 'txt', '-o', output_file])
+        
+        # Add any custom options
+        if 'options' in task_parameters:
+            options = task_parameters['options']
+            if isinstance(options, list):
+                command.extend(options)
+            else:
+                command.append(options)
+        
+        # Run the command
+        return_code, stdout, stderr = self.run_command(command, timeout)
+        
+        result = {
+            'return_code': return_code,
+            'success': return_code == 0,
+            'stdout': stdout,
+            'stderr': stderr
+        }
+        
+        # If successful, parse the output
+        if result['success'] and os.path.exists(output_file):
+            try:
+                with open(output_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    file_content = f.read()
+                
+                # Parse the file content based on format
+                if output_format == 'xml':
+                    events = self.parse_xml_output(file_content, target_host, port)
+                elif output_format == 'csv':
+                    events = self.parse_csv_output(file_content, target_host, port)
+                else:
+                    events = self.parse_text_output(file_content, target_host, port)
+                
+                # Publish events to message broker
+                self.publish_events(events, task_parameters.get('engagement_id'))
+                
+                result['event_count'] = len(events)
+                result['scan_time'] = datetime.now().isoformat()
+            except Exception as e:
+                self.logger.error(f"Error parsing Nikto output: {str(e)}")
+                result['error'] = str(e)
+                result['success'] = False
+        
+        return result
+    
+    def parse_xml_output(self, xml_content: str, target_host: str, port: int) -> List[Dict]:
+        """
+        Parse Nikto XML output into standardized events.
+        
+        Args:
+            xml_content: Nikto XML output as string
+            target_host: The target host that was scanned
+            port: The port that was scanned
+            
+        Returns:
+            List[Dict]: List of events generated from the Nikto output
+        """
+        events = []
+        
+        try:
+            root = ET.fromstring(xml_content)
+            
+            # Extract scan info
+            scan_timestamp = None
+            scan_info = root.find('.//scandetails')
+            if scan_info is not None:
+                scan_timestamp = scan_info.get('starttime')
+            
+            if not scan_timestamp:
+                scan_timestamp = datetime.now().isoformat()
+            
+            # Process each finding
+            for item in root.findall('.//item'):
+                description = item.find('description')
+                if description is not None and description.text:
+                    # Extract severity based on keywords (Nikto doesn't provide explicit severity)
+                    severity = self._determine_severity(description.text)
+                    
+                    # Extract additional details
+                    method = ""
+                    uri = ""
+                    id_value = ""
+                    
+                    id_elem = item.find('id')
+                    if id_elem is not None:
+                        id_value = id_elem.text
+                    
+                    uri_elem = item.find('uri')
+                    if uri_elem is not None:
+                        uri = uri_elem.text
+                    
+                    method_elem = item.find('method')
+                    if method_elem is not None:
+                        method = method_elem.text
+                    
+                    # Create web vulnerability event
+                    web_vuln_event = {
+                        "event_type": "WebVulnerabilityFound",
+                        "host": target_host,
+                        "port": port,
+                        "vulnerability": f"Nikto-{id_value}" if id_value else "Nikto Finding",
+                        "description": description.text,
+                        "severity": severity,
+                        "uri": uri,
+                        "method": method,
+                        "timestamp": scan_timestamp
+                    }
+                    events.append(web_vuln_event)
+        
+        except Exception as e:
+            self.logger.error(f"Error parsing Nikto XML: {str(e)}")
+        
+        return events
+    
+    def parse_csv_output(self, csv_content: str, target_host: str, port: int) -> List[Dict]:
+        """
+        Parse Nikto CSV output into standardized events.
+        
+        Args:
+            csv_content: Nikto CSV output as string
+            target_host: The target host that was scanned
+            port: The port that was scanned
+            
+        Returns:
+            List[Dict]: List of events generated from the Nikto output
+        """
+        events = []
+        
+        try:
+            lines = csv_content.splitlines()
+            reader = csv.reader(lines)
+            
+            # Skip header row if it exists
+            header = next(reader, None)
+            
+            for row in reader:
+                if len(row) >= 4:  # Expecting at least 4 columns
+                    # Nikto CSV format: host,ip,port,vulnerabilityID,CVSS score,uri,http method,description
+                    # Column indices may vary, adapting to common formats
+                    
+                    # Extract fields based on expected format
+                    finding_id = row[3] if len(row) > 3 else ""
+                    uri = row[5] if len(row) > 5 else ""
+                    method = row[6] if len(row) > 6 else ""
+                    description = row[7] if len(row) > 7 else ""
+                    
+                    # If description is not available in the expected column, use a fallback
+                    if not description and len(row) > 4:
+                        description = row[4]
+                    
+                    if description:
+                        severity = self._determine_severity(description)
+                        
+                        # Create web vulnerability event
+                        web_vuln_event = {
+                            "event_type": "WebVulnerabilityFound",
+                            "host": target_host,
+                            "port": port,
+                            "vulnerability": f"Nikto-{finding_id}" if finding_id else "Nikto Finding",
+                            "description": description,
+                            "severity": severity,
+                            "uri": uri,
+                            "method": method,
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        events.append(web_vuln_event)
+        
+        except Exception as e:
+            self.logger.error(f"Error parsing Nikto CSV: {str(e)}")
+        
+        return events
+    
+    def parse_text_output(self, text_content: str, target_host: str, port: int) -> List[Dict]:
+        """
+        Parse Nikto text output into standardized events.
+        
+        Args:
+            text_content: Nikto text output as string
+            target_host: The target host that was scanned
+            port: The port that was scanned
+            
+        Returns:
+            List[Dict]: List of events generated from the Nikto output
+        """
+        events = []
+        
+        try:
+            # Regex pattern for Nikto findings in text output
+            # Example: + OSVDB-3092: /admin/: This might be interesting...
+            pattern = r"\+ (.*?): (.*)"
+            
+            for line in text_content.splitlines():
+                match = re.search(pattern, line)
+                if match:
+                    finding_id = match.group(1)
+                    description = match.group(2)
+                    
+                    # Extract URI if present
+                    uri = ""
+                    uri_match = re.search(r"(/[^\s:]+)", description)
+                    if uri_match:
+                        uri = uri_match.group(1)
+                    
+                    # Determine severity
+                    severity = self._determine_severity(description)
+                    
+                    # Create web vulnerability event
+                    web_vuln_event = {
+                        "event_type": "WebVulnerabilityFound",
+                        "host": target_host,
+                        "port": port,
+                        "vulnerability": finding_id if finding_id else "Nikto Finding",
+                        "description": description,
+                        "severity": severity,
+                        "uri": uri,
+                        "method": "",  # Not easily extractable from text output
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    events.append(web_vuln_event)
+        
+        except Exception as e:
+            self.logger.error(f"Error parsing Nikto text: {str(e)}")
+        
+        return events
+    
+    def _determine_severity(self, description: str) -> str:
+        """
+        Determine the severity of a finding based on its description.
+        
+        Args:
+            description: Description of the finding
+            
+        Returns:
+            str: Severity level (critical, high, medium, low, info)
+        """
+        # Keywords indicating critical severity
+        critical_keywords = ['remote code execution', 'rce', 'sql injection', 'command injection', 'arbitrary file upload']
+        
+        # Keywords indicating high severity
+        high_keywords = ['xss', 'cross-site scripting', 'directory traversal', 'path traversal', 'authentication bypass', 
+                         'information disclosure', 'credentials', 'password']
+        
+        # Keywords indicating medium severity
+        medium_keywords = ['clickjacking', 'version disclosure', 'outdated', 'deprecated', 'misconfiguration']
+        
+        # Keywords indicating low severity
+        low_keywords = ['http methods', 'OPTIONS', 'TRACE', 'cookie without secure flag', 'cookie without httponly']
+        
+        # Check description against keywords
+        description_lower = description.lower()
+        
+        for keyword in critical_keywords:
+            if keyword in description_lower:
+                return 'critical'
+        
+        for keyword in high_keywords:
+            if keyword in description_lower:
+                return 'high'
+        
+        for keyword in medium_keywords:
+            if keyword in description_lower:
+                return 'medium'
+        
+        for keyword in low_keywords:
+            if keyword in description_lower:
+                return 'low'
+        
+        # Default to informational
+        return 'info'
